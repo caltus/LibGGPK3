@@ -51,8 +51,12 @@ public class FileRecord {
 	public virtual ReadOnlyMemory<byte> Read(Bundle? bundle = null) {
 		if (bundle is not null)
 			return bundle.Read(Offset, Size);
+		// TODO: Bundle cache implementation
+		bundle = BundleRecord.Index._BundleToWrite;
+		if (bundle?.Record == BundleRecord) // The bundle being written
+			return bundle.ReadWithoutCache(Offset, Size);
 		if (BundleRecord.TryGetBundle(out bundle, out var ex))
-			using (bundle) // TODO: Bundle cache implementation
+			using (bundle)
 				return bundle.ReadWithoutCache(Offset, Size);
 		ex?.ThrowKeepStackTrace();
 		throw new FileNotFoundException("Failed to get bundle: " + BundleRecord.Path);
@@ -70,6 +74,9 @@ public class FileRecord {
 		var (offset, length) = range.GetOffsetAndLength(Size);
 		if (bundle is not null)
 			return bundle.Read(Offset + offset, length);
+		bundle = BundleRecord.Index._BundleToWrite;
+		if (bundle?.Record == BundleRecord)
+			return bundle.ReadWithoutCache(Offset + offset, length);
 		if (BundleRecord.TryGetBundle(out bundle, out var ex))
 			using (bundle) // TODO: Bundle cache implementation
 				return bundle.ReadWithoutCache(Offset + offset, length);
@@ -109,7 +116,6 @@ public class FileRecord {
 				index._BundleToWrite = null;
 				ms.SetLength(0);
 				index._BundleStreamToWrite = null;
-				index.WR_BundleStreamToWrite.SetTarget(ms);
 			}
 		}
 		if (saveIndex)
@@ -132,8 +138,10 @@ public class FileRecord {
 			var ms = index._BundleStreamToWrite;
 			if (b is null) {
 				index._BundleToWrite = b = index.GetBundleToWrite(out var originalSize);
-				if (!index.WR_BundleStreamToWrite.TryGetTarget(out index._BundleStreamToWrite))
+				if (!index.WR_BundleStreamToWrite.TryGetTarget(out index._BundleStreamToWrite)) {
 					index._BundleStreamToWrite = new(originalSize + newSize);
+					index.WR_BundleStreamToWrite.SetTarget(index._BundleStreamToWrite);
+				}
 				ms = index._BundleStreamToWrite;
 				ms.Write(index._BundleToWrite.ReadWithoutCache(0, originalSize)); // Read original data of bundle
 			}
@@ -151,7 +159,6 @@ public class FileRecord {
 				index._BundleToWrite = null;
 				ms.SetLength(0);
 				index._BundleStreamToWrite = null;
-				index.WR_BundleStreamToWrite.SetTarget(ms);
 			}
 		}
 		if (saveIndex)

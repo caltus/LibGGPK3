@@ -4,7 +4,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
-using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -16,8 +15,7 @@ using Eto.Forms;
 using LibBundledGGPK3;
 
 using LibGGPK3;
-
-using SystemExtensions.Collections;
+using SystemExtensions;
 
 namespace VPatchGGPK3;
 public class MainWindow : Form {
@@ -54,9 +52,10 @@ public class MainWindow : Form {
 		layout.BeginVertical();
 		layout.Add(new Button((_, _) => {
 			var ofd = new OpenFileDialog() {
-				Title = "選擇 Content.ggpk"
+				Title = "選擇 Content.ggpk/_.index.bin",
 			};
-			ofd.Filters.Add(new FileFilter("GGPK File", ".ggpk"));
+			ofd.Filters.Add(new("GGPK File", ".ggpk"));
+			ofd.Filters.Add(new("Index File", ".bin"));
 			if (File.Exists(ggpkPath.Text))
 				ofd.FileName = ggpkPath.Text;
 			if (ofd.ShowDialog(this) == DialogResult.Ok)
@@ -122,20 +121,27 @@ public class MainWindow : Form {
 		if (args.Length > 1 && TrySetPath(Path.GetFullPath(args[1])))
 			return;
 
-		if (File.Exists("VPatchGGPK3.txt")) {
+		var txt = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData,
+			Environment.SpecialFolderOption.DoNotVerify) + "/LibGGPK3/VPatchGGPK3.txt";
+		if (File.Exists(txt)) {
 			try {
-				if (TrySetPath(File.ReadAllText("VPatchGGPK3.txt")))
+				if (TrySetPath(File.ReadAllText(txt)))
 					return;
-			} catch { /*No permission ro read*/ }
+			} catch { /* No permission */ }
 		}
 
-		if (OperatingSystem.IsMacOS() && TrySetPath("~/Library/Application Support/Path of Exile/Content.ggpk"))
+		if (OperatingSystem.IsMacOS() && (TrySetPath("~/Library/Application Support/Path of Exile/Content.ggpk", true)
+			|| TrySetPath("~/Library/Application Support/Steam/steamapps/common/Path of Exile/Bundles2/_.index.bin", true)))
 			return;
-		if (OperatingSystem.IsWindows())
-			TrySetPath(@"C:\Program Files (x86)\Grinding Gear Games\Path of Exile\Content.ggpk");
+		if (OperatingSystem.IsWindows() && (TrySetPath(@"C:\Program Files (x86)\Grinding Gear Games\Path of Exile\Content.ggpk")
+			|| TrySetPath(@"C:\Program Files (x86)\Steam\steamapps\common\Path of Exile\Bundles2\_.index.bin")))
+			return;
+		if (OperatingSystem.IsLinux())
+			TrySetPath("~/.steam/steam/steamapps/common/Path of Exile/Bundles2/_.index.bin", true);
 
-		bool TrySetPath(string path) {
-			if (File.Exists(path)) {
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		bool TrySetPath(string path, bool expand = false) {
+			if (File.Exists(expand ? Utils.ExpandPath(path) : path)) {
 				ggpkPath.Text = path;
 				return true;
 			}
@@ -146,14 +152,16 @@ public class MainWindow : Form {
 	private async void OnButtonClick(object? sender, EventArgs e) {
 		var path = ggpkPath.Text;
 		try {
-			await File.WriteAllTextAsync("VPatchGGPK3.txt", path);
+			var dir = Directory.CreateDirectory(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData,
+			Environment.SpecialFolderOption.DoNotVerify) + "/LibGGPK3").FullName;
+			await File.WriteAllTextAsync(dir + "/VPatchGGPK3.txt", path);
 		} catch { /*ignore*/ }
 
 		try {
 			output.Append("Getting patch information . . .\r\n", true);
 			using var jd = await JsonDocument.ParseAsync(await http.GetStreamAsync(tw.Checked ? "https://poedb.tw/fg/pin_tw.json" : "https://poedb.tw/fg/pin_cn.json"));
 			var json = jd.RootElement;
-			var url = await Task.Run(() => GetPatchServer());
+			var url = await PatchClient.GetPatchCdnUrlAsync(PatchClient.ServerEndPoints.US);
 			var officialVersion = url[(url.LastIndexOf('/', url.Length - 2) + 1)..^1];
 			if (json.GetProperty("version").GetString()! != officialVersion) {
 				MessageBox.Show(this, "Server Version not match Patch Version\r\n編年史中文化更新中，請稍後再嘗試", "Error", MessageBoxType.Error);
@@ -166,58 +174,54 @@ public class MainWindow : Form {
 				return;
 			}
 
-			output.Append("Reading ggpk: " + path + "\r\n", true);
-			using var ggpk = await Task.Run(() => new GGPK(path));
-			var md5 = json.GetProperty("md5").GetString()!;
-			output.Append("Downloading patch file . . .\r\n", true);
-			var b = await http.GetByteArrayAsync("https://poedb.tw/fg/" + md5 + ".zip");
-			if (!md5.Equals(Convert.ToHexString(System.Security.Cryptography.MD5.HashData(b)), StringComparison.OrdinalIgnoreCase)) {
-				MessageBox.Show(this, "下載檔案的MD5校驗失敗，請檢查網路環境後再重試", "Error", MessageBoxType.Error);
-				output.Append("\r\nMD5 verification failed!\r\n", true);
-				return;
-			}
-			using var zip = new ZipArchive(new MemoryStream(b));
-			var total = zip.Entries.Count(e => !e.FullName.EndsWith('/')/* !dir */);
-			if (zip.Entries.Any(e => e.FullName.Equals("Bundles2/_.index.bin", StringComparison.OrdinalIgnoreCase))) {
-				total -= GGPK.Replace(ggpk.Root, zip.Entries, (fr, p, added) => {
-					output.Append($"{(added ? "Added: " : "Replaced: ")}{p}\r\n");
-					return false;
-				}, true);
+			output.Append("Reading ggpk/index: " + path + "\r\n", true);
+			BundledGGPK? ggpk = null;
+			LibBundle3.Index index;
+			if (path.EndsWith(".bin")) {
+				index = await Task.Run(() => new LibBundle3.Index(path));
 			} else {
-				ggpk.Dispose();
-				using var bggpk = new BundledGGPK(path, false);
-				total -= LibBundle3.Index.Replace(bggpk.Index, zip.Entries, (fr, p) => {
-					output.Append($"Replaced: {p}\r\n");
-					return false;
-				});
+				ggpk =  await Task.Run(() => new BundledGGPK(path, false));
+				index = ggpk.Index;
 			}
-			output.Append("\r\nAll finished!\r\n", true);
-			if (total > 0)
-				output.Append($"Error: {total} files failed to add/replace!\r\n", true);
-			else
-				output.Append("中文化完成!\r\n", true);
+			try {
+				var md5 = json.GetProperty("md5").GetString()!;
+				output.Append("Downloading patch file . . .\r\n", true);
+				var b = await http.GetByteArrayAsync("https://poedb.tw/fg/" + md5 + ".zip");
+				if (!md5.Equals(Convert.ToHexString(System.Security.Cryptography.MD5.HashData(b)), StringComparison.OrdinalIgnoreCase)) {
+					MessageBox.Show(this, "下載檔案的MD5校驗失敗，請檢查網路環境後再重試", "Error", MessageBoxType.Error);
+					output.Append("\r\nMD5 verification failed!\r\n", true);
+					return;
+				}
+				using var zip = new ZipArchive(new MemoryStream(b));
+				var total = zip.Entries.Count(e => !e.FullName.EndsWith('/')/* !dir */);
+				if (zip.Entries.Any(e => e.FullName.Equals("Bundles2/_.index.bin", StringComparison.OrdinalIgnoreCase))) {
+					if (ggpk is null) {
+						zip.ExtractToDirectory(Path.GetDirectoryName(Path.GetDirectoryName(path))!, true);
+						total = 0;
+					} else {
+						total -= GGPK.Replace(ggpk.Root, zip.Entries, (fr, p, added) => {
+							output.Append($"{(added ? "Added: " : "Replaced: ")}{p}\r\n");
+							return false;
+						}, true);
+					}
+				} else {
+					total -= LibBundle3.Index.Replace(index, zip.Entries, (fr, p) => {
+						output.Append($"Replaced: {p}\r\n");
+						return false;
+					});
+				}
+				output.Append("\r\nAll finished!\r\n", true);
+				if (total > 0)
+					output.Append($"Error: {total} files failed to add/replace!\r\n", true);
+				else
+					output.Append("中文化完成!\r\n", true);
+			} finally {
+				index.Dispose();
+				ggpk?.Dispose();
+			}
 		} catch (Exception ex) {
 			MessageBox.Show(this, ex.ToString(), "Error", MessageBoxType.Error);
 			output.Append("Error!\r\n", true);
 		}
-	}
-
-	/// <summary>
-	/// Get POE patch server url (Requires internet connection)
-	/// </summary>
-	/// <exception cref="SocketException" />
-	[SkipLocalsInit]
-	public static unsafe string GetPatchServer(bool tw = false) {
-		using var tcp = new Socket(SocketType.Stream, ProtocolType.Tcp);
-		if (tw)
-			tcp.Connect("patch.pathofexile.tw", 12999);
-		else
-			tcp.Connect("patch.pathofexile.com", 12995); // (us.)login.pathofexile.com
-		var b = stackalloc byte[256];
-		*(short*)b = 0x0601; // b[0] = 1, b[1] = 6
-		tcp.Send(new ReadOnlySpan<byte>(b, 2));
-		if (tcp.Receive(new Span<byte>(b, 256)) < 36)
-			throw new EndOfStreamException("Unable to get POE patch server url");
-		return new string((char*)(b + 35), 0, b[34]);
 	}
 }
